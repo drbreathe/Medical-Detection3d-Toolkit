@@ -28,10 +28,10 @@ __C.general.partition_type = 'DISABLE'
 
 # if partition type = 'SIZE', set the partition size (unit: mm).
 # it is recommended to set this value as the same with the physical cropping size in the training phase
-__C.general.partition_size = [51.2, 51.2, 51.2]
+# __C.general.partition_size = [46, 46, 46]
 
 # the moving stride of the partition window. If set it as the same with the partition size, there will be no overlap
 # between the partition windows. Otherwise, the value of the overlapped area will be averaged.
 # it is recommended to set this value as 1/4 of the partition size in order to avoid the apparent in-consistence between
 # different partition window.
-__C.general.partition_stride = [51.2, 51.2, 51.2]
+# __C.general.partition_stride = [x / 4 for x in __C.general.partition_size]

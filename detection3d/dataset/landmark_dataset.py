@@ -4,6 +4,7 @@ import pandas as pd
 import SimpleITK as sitk
 import torch
 from torch.utils.data import Dataset
+import torchio as tio
 
 from detection3d.utils.image_tools import select_random_voxels_in_multi_class_mask, \
   crop_image, convert_image_to_tensor, get_image_frame
@@ -237,6 +238,137 @@ class LandmarkDetectionDataset(Dataset):
     reordered_selected_mask.CopyInformation(landmark_mask) #Copies Physical world space such as origin , spacing etc.
 
     return reordered_selected_mask
+  
+  # def augment(self, image, mask=None):
+  #     """
+  #     Apply TorchIO augmentations to 3D image (and optionally to landmark mask).
+  #     :param image: SimpleITK.Image (cropped and normalized)
+  #     :param mask: Optional SimpleITK.Image (for landmarks or segmentation)
+  #     :return: Augmented image (and mask if provided)
+  #     """
+  #     # Convert to TorchIO subject
+  #     subject_dict = {
+  #         'image': tio.ScalarImage(tensor=sitk.GetArrayFromImage(image).astype('float32')[None])
+  #     }
+  #     if mask is not None:
+  #         subject_dict['mask'] = tio.LabelMap(tensor=sitk.GetArrayFromImage(mask).astype('float32')[None])
+
+  #     subject = tio.Subject(subject_dict)
+
+  #     # Define augmentations
+  #     transform = tio.Compose([
+  #         tio.RandomAffine(scales=(0.9, 1.1), degrees=self.augmentation_orientation_radian, translation=5), # applies to both image and mask
+  #         tio.RandomNoise(mean=0, std=0.05), #applies to image
+  #         tio.RandomGamma(log_gamma=(-0.3, 0.3)), # applies to image
+  #         tio.RandomFlip(axes=(0,)),  # applies to both image and mask
+  #     ])
+
+  #     # Apply transforms
+  #     transformed = transform(subject)
+
+  #     # Convert back to SimpleITK
+  #     image_aug = sitk.GetImageFromArray(transformed['image'].data.squeeze().numpy())
+  #     image_aug.CopyInformation(image)
+
+  #     if mask is not None:
+  #         mask_aug = sitk.GetImageFromArray(transformed['mask'].data.squeeze().numpy())
+  #         mask_aug.CopyInformation(mask)
+  #         return image_aug, mask_aug
+
+  #     return image_aug
+
+  
+  def augment(self, image, mask=None):
+      """
+      Apply TorchIO augmentations to a 3D CBCT image and optional mask.
+      
+      Args:
+          image (SimpleITK.Image): Input cropped image in physical space.
+          mask (SimpleITK.Image, optional): Corresponding label/landmark mask.
+      
+      Returns:
+          (image_aug, mask_aug) if mask is provided, else image_aug only
+      """
+
+      # Convert to TorchIO tensors (C, H, W, D) format
+      image_tensor = sitk.GetArrayFromImage(image).astype(np.float32)[None]
+      subject_dict = {
+          'image': tio.ScalarImage(tensor=image_tensor)
+      }
+
+      if mask is not None:
+          mask_tensor = sitk.GetArrayFromImage(mask).astype(np.float32)[None]
+          subject_dict['mask'] = tio.LabelMap(tensor=mask_tensor)
+
+      subject = tio.Subject(subject_dict)
+
+      # Geometry + intensity augmentation pipeline
+      transform = tio.Compose([
+          tio.RandomAffine(scales=(0.9, 1.1), degrees=10, translation=5, p=0.3),  
+          # 🔄 Applies global rotation, scaling, and translation to simulate patient pose variation
+          
+          tio.RandomFlip(axes=(0)),  
+          # 🔁 Flips the volume along the left–right to simulate mirrored anatomy
+
+          # tio.RandomElasticDeformation(num_control_points=4, max_displacement=2.0, locked_borders=1, include=('image',), p=0.3),  
+          # # 🧬 Introduces smooth, non-rigid deformation to mimic soft tissue elasticity
+
+
+          # tio.RandomAnisotropy(axes=(2,), downsampling=(2, 3)),  
+          # # 📉 Simulates thick-slice axial scans by downsampling along the z-axis
+
+          tio.RandomMotion(num_transforms=1, include=('image',), p=0.1),  
+          # 🎞️ Adds ghosting-like artifacts to simulate patient movement during acquisition
+
+          tio.RandomNoise(mean=0, std=0.02, include=('image',), p=0.3),  
+          # 🟡 Injects Gaussian noise into the image to model scanner noise or low-dose effects
+
+          tio.RandomGamma(log_gamma=(-0.2, 0.2), include=('image',), p=0.3),  
+          # 🌗 Randomly adjusts image contrast using gamma correction to simulate intensity variability
+      ])
+
+      # Apply the composed transform
+      transformed = transform(subject)
+
+      # Convert back to SimpleITK image
+      image_aug = sitk.GetImageFromArray(transformed['image'].data.squeeze(0).numpy())
+      image_aug.CopyInformation(image)
+
+      if mask is not None:
+          mask_aug = sitk.GetImageFromArray(transformed['mask'].data.squeeze(0).numpy())
+          mask_aug.CopyInformation(mask)
+          return image_aug, mask_aug
+
+      return image_aug
+
+  def pad_image(self, image, padding_voxels, pad_value=0):
+      """
+      Pads a SimpleITK image and adjusts its origin.
+
+      Args:
+          image (sitk.Image): 3D input image or mask
+          padding_voxels (tuple): (x, y, z) number of voxels to pad on each side
+          pad_value (float): value to use for padding (e.g., 0 for image, 0 for mask)
+
+      Returns:
+          sitk.Image: padded image with updated origin
+      """
+      spacing = image.GetSpacing()
+      old_origin = image.GetOrigin()
+
+      pad_filter = sitk.ConstantPadImageFilter()
+      pad_filter.SetPadLowerBound(padding_voxels)
+      pad_filter.SetPadUpperBound(padding_voxels)
+      pad_filter.SetConstant(pad_value)
+
+      padded = pad_filter.Execute(image)
+
+      # Update origin to maintain spatial correctness
+      new_origin = tuple(
+          old_origin[i] - padding_voxels[i] * spacing[i] for i in range(3)
+      )
+      padded.SetOrigin(new_origin)
+      return padded
 
   def __getitem__(self, index):
     """ get a training sample - image(s) and segmentation pair
@@ -254,6 +386,10 @@ class LandmarkDetectionDataset(Dataset):
     landmark_coords = self.landmark_coords_dict[image_name]
     landmark_mask_path = self.landmark_mask_path[index]
     landmark_mask = sitk.ReadImage(landmark_mask_path, sitk.sitkFloat32)
+    
+    padding_voxels = (16, 16, 16)
+    image = self.pad_image(image, padding_voxels, pad_value=0)
+    landmark_mask = self.pad_image(landmark_mask, padding_voxels, pad_value=-1)
 
     # sampling a crop center
     if self.sampling_method == 'GLOBAL':
@@ -266,13 +402,19 @@ class LandmarkDetectionDataset(Dataset):
     crop_center_mm += np.random.uniform(-self.augmentation_translation, self.augmentation_translation, size=[3])
 
     # sample a crop from image and normalize it
+    # We are working with one image and one mask at a time.
+    
+    landmark_mask = crop_image(landmark_mask, crop_center_mm, self.crop_size, self.crop_spacing, 'NN')
+    landmark_mask = self.select_samples_in_the_landmark_mask(landmark_mask, self.landmark_coords_dict[image_name])
+
     for idx in range(len(images)):
       images[idx] = crop_image(images[idx], crop_center_mm, self.crop_size, self.crop_spacing, self.interpolation)
       if self.crop_normalizers[idx] is not None:
-        images[idx] = self.crop_normalizers[idx](images[idx])
+          images[idx] = self.crop_normalizers[idx](images[idx])
 
-    landmark_mask = crop_image(landmark_mask, crop_center_mm, self.crop_size, self.crop_spacing, 'NN')
-    landmark_mask = self.select_samples_in_the_landmark_mask(landmark_mask, self.landmark_coords_dict[image_name])
+      # Apply augmentations
+      if self.mode == 'train' and self.augmentation_turn_on:
+          images[idx], landmark_mask = self.augment(images[idx], landmark_mask)
 
     # convert image and masks to tensors
     image_tensor = convert_image_to_tensor(images)

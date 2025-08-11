@@ -188,7 +188,7 @@ def detection_single_image(image, image_name, model, gpu_id, save_prob, save_fol
 
         # only keep probability of the largest connected component
         landmark_mask_cc = sitk.GetArrayFromImage(landmark_mask_cc)
-        masked_landmark_mask_prob = np.multiply(landmark_mask_cc.astype(np.float), landmark_mask_prob)
+        masked_landmark_mask_prob = np.multiply(landmark_mask_cc.astype(np.float32), landmark_mask_prob)
 
         # compute the weighted mass center of the probability map
         masked_landmark_mask_prob = sitk.GetImageFromArray(masked_landmark_mask_prob)
@@ -211,152 +211,138 @@ def detection_single_image(image, image_name, model, gpu_id, save_prob, save_fol
 
     return detected_landmark_df
 
+import pandas as pd
 
-def detection(input_path, model_folder, gpu_id, return_landmark_file, save_landmark_file, save_prob, output_folder):
-    """ volumetric image segmentation engine
-    :param input_path:              The path of text file, a single image file or a root dir with all image files
-    :param model_folder:            The path of trained model
-    :param gpu_id:                  Which gpu to use, set as -1 to use CPU for inference
-    :param return_landmark_file:    Whether return landmark file
-    :param save_landmark_file:      Whether save landmark file to disk
-    :param save_prob:               Whether save probability maps for all detected landmarks
-    :param output_folder:           The path of out folder
-    :return: None
-    """
+import os
+import time
+import numpy as np
+import pandas as pd
+import torch
+import SimpleITK as sitk
+from detection3d.utils.image_tools import convert_tensor_to_image, resample_spacing, pick_largest_connected_component, weighted_voxel_center
+from detection3d.utils.file_io import load_config
+from detection3d.utils.model_io import get_checkpoint_folder
+from detection3d.dataset.landmark_dataset import read_image_list
+# from detection3d.utils import load_det_model, read_test_folder, detection_voi
 
-    # load model
+def detection(input_path, model_folder, gpu_id, return_landmark_file, save_landmark_file, save_prob, output_folder, prob_threshold=0.5):
+    """Volumetric landmark detection engine with confidence thresholding."""
+    
+    # Load model
     begin = time.time()
     model = load_det_model(model_folder, gpu_id)
     load_model_time = time.time() - begin
 
-    # load landmark label dictionary
+    # Load landmark label dictionary
     landmark_dict = model['train_cfg'].general.target_landmark_label
-    landmark_name_list, landmark_label_list = [], []
-    for landmark_name in landmark_dict.keys():
-        landmark_name_list.append(landmark_name)
-        landmark_label_list.append(landmark_dict[landmark_name])
+    landmark_name_list, landmark_label_list = zip(*landmark_dict.items())
     landmark_label_reorder = np.argsort(landmark_label_list)
 
-    # load test images
+    # Load test images
     if os.path.isfile(input_path):
         if input_path.endswith('.csv'):
             file_name_list, file_path_list, _, _ = read_image_list(input_path, 'test')
         else:
-            if input_path.endswith('.mhd') or input_path.endswith('.mha') or \
-                    input_path.endswith('.nii.gz') or input_path.endswith('.nii') or \
-                    input_path.endswith('.hdr') or input_path.endswith('.image3d'):
-                im_name = os.path.basename(input_path)
-                file_name_list = [im_name]
-                file_path_list = [input_path]
-
-            else:
-                raise ValueError('Unsupported input path.')
-
+            file_name_list = [os.path.basename(input_path)]
+            file_path_list = [input_path]
     elif os.path.isdir(input_path):
         file_name_list, file_path_list = read_test_folder(input_path)
-
     else:
-        if input_path.endswith('.csv'):
-            raise ValueError('The file doest no exist: {}.'.format(input_path))
-        else:
-            raise ValueError('Unsupported input path.')
+        raise ValueError(f"Unsupported input path: {input_path}")
 
     if save_landmark_file or save_prob:
-        if not os.path.isdir(output_folder):
-            os.makedirs(output_folder)
+        os.makedirs(output_folder, exist_ok=True)
 
-    # test each case
-    landmark_files = []
+    # Collect results
+    all_results = []
     for i, file_path in enumerate(file_path_list):
-        print('{}: {}'.format(i, file_path))
+        file_name = file_name_list[i]
+        print(f"[{i}] Processing: {file_name}")
 
         if not os.path.isfile(file_path):
-            print('File {} does not exist!'.format(file_path))
+            print(f"File not found: {file_path}")
             continue
 
-        # load image
-        begin = time.time()
+        # Load and resample image
+        start_read = time.time()
         image = sitk.ReadImage(file_path, sitk.sitkFloat32)
-        read_image_time = time.time() - begin
+        iso_image = resample_spacing(image, model['crop_spacing'], model['max_stride'], model['interpolation'])
+        read_image_time = time.time() - start_read
 
-        iso_image = resample_spacing(image, model['crop_spacing'], model['max_stride'],
-                                     model['interpolation'])
-        assert isinstance(iso_image, sitk.Image)
+        # Forward pass
+        start_voxel = [0, 0, 0]
+        end_voxel = [int(iso_image.GetSize()[i]) for i in range(3)]
+        start_infer = time.time()
+        preds = detection_voi(model, iso_image, start_voxel, end_voxel, gpu_id is not None and gpu_id >= 0)
 
-        start_voxels = [[0, 0, 0]]
-        end_voxels = [[int(iso_image.GetSize()[idx]) for idx in range(3)]]
+        infer_time = time.time() - start_infer
 
-        begin = time.time()
-        voi_landmark_mask_preds = []
-        for idx in range(len(start_voxels)):
-            start_voxel, end_voxel = start_voxels[idx], end_voxels[idx]
+        preds = preds.cpu().squeeze(0)
+        pred_images = convert_tensor_to_image(preds, sitk.sitkFloat32)
 
-            voi_landmarks_pred = \
-                detection_voi(model, iso_image, start_voxel, end_voxel, gpu_id > 0)
+        # Evaluate each landmark class
+        start_post = time.time()
+        for j in range(model['num_landmark_classes']):
+            landmark_mask_pred = pred_images[j + 1]  # skip background
+            landmark_mask_pred.CopyInformation(iso_image)
 
-            voi_landmark_mask_preds.append(voi_landmarks_pred)
-            print('{:0.2f}%'.format((idx + 1) / len(start_voxels) * 100))
+            landmark_mask_prob = sitk.GetArrayFromImage(landmark_mask_pred)
+            max_prob = float(np.max(landmark_mask_prob))
 
-        # convert to landmark masks
-        landmark_mask_preds = voi_landmark_mask_preds[0].cpu()
-        assert landmark_mask_preds.shape[0] == 1
-        landmark_mask_preds = torch.squeeze(landmark_mask_preds)
-        landmark_mask_preds = convert_tensor_to_image(landmark_mask_preds, sitk.sitkFloat32)
-        inference_time = time.time() - begin
+            # Threshold and clean prediction
+            binary_mask = (landmark_mask_prob >= prob_threshold).astype(np.uint8)
+            cleaned = pick_largest_connected_component(sitk.GetImageFromArray(binary_mask), [1])
+            cleaned_array = sitk.GetArrayFromImage(cleaned)
 
-        begin = time.time()
-        detected_landmark = []
-        for j in range(0, model['num_landmark_classes']):
-          landmark_mask_pred = landmark_mask_preds[j + 1] # exclude the background
-          landmark_mask_pred.CopyInformation(iso_image)
+            # Weight by prob
+            masked_prob = cleaned_array * landmark_mask_prob
+            masked_prob_image = sitk.GetImageFromArray(masked_prob)
+            masked_prob_image.CopyInformation(iso_image)
 
-          if save_prob:
-            prob_path = os.path.join(output_folder, '{}_{}.mha'.format(file_name_list[i], j))
-            sitk.WriteImage(landmark_mask_pred, prob_path)
+            voxel_coord = weighted_voxel_center(masked_prob_image, prob_threshold, 1.0)
+            landmark_name = landmark_name_list[landmark_label_reorder[j]]
+            if voxel_coord is not None and max_prob >= prob_threshold:
+                # Ensure Python floats, not numpy types/array
+                world_coord = masked_prob_image.TransformContinuousIndexToPhysicalPoint(
+                    tuple(float(v) for v in voxel_coord)
+                )
 
-          landmark_mask_prob = sitk.GetArrayFromImage(landmark_mask_pred)
-          # threshold the probability map to get the binary mask
-          prob_threshold = 0.5
-          landmark_mask_binary = np.zeros_like(landmark_mask_prob, dtype=np.int16)
-          landmark_mask_binary[landmark_mask_prob >= prob_threshold] = 1
-          landmark_mask_binary[landmark_mask_prob < prob_threshold] = 0
+                result = {
+                    'file_name': file_name,
+                    'landmark_name': landmark_name,
+                    'detected': 1,
+                    'x': world_coord[0],
+                    'y': world_coord[1],
+                    'z': world_coord[2],
+                    'confidence': max_prob
+                }
+            else:
+                result = {
+                    'file_name': file_name,
+                    'landmark_name': landmark_name,
+                    'detected': 0,
+                    'x': -1,
+                    'y': -1,
+                    'z': -1,
+                    'confidence': max_prob
+                }
 
-          # pick the largest connected component
-          landmark_mask_cc = sitk.GetImageFromArray(landmark_mask_binary)
-          landmark_mask_cc = pick_largest_connected_component(landmark_mask_cc, [1])
+            all_results.append(result)
 
-          # only keep probability of the largest connected component
-          landmark_mask_cc = sitk.GetArrayFromImage(landmark_mask_cc)
-          masked_landmark_mask_prob = np.multiply(landmark_mask_cc.astype(np.float32), landmark_mask_prob)
+            # Optionally save probability map
+            if save_prob:
+                sitk.WriteImage(landmark_mask_pred, os.path.join(output_folder, f"{file_name}_{landmark_name}.mha"))
 
-          # compute the weighted mass center of the probability map
-          masked_landmark_mask_prob = sitk.GetImageFromArray(masked_landmark_mask_prob)
-          masked_landmark_mask_prob.CopyInformation(iso_image)
-          voxel_coordinate = weighted_voxel_center(masked_landmark_mask_prob, prob_threshold, 1.0)
+        post_time = time.time() - start_post
+        print(f"⏱ read: {read_image_time:.2f}s | infer: {infer_time:.2f}s | post: {post_time:.2f}s")
+        
+    print(all_results)
+    result_df = pd.DataFrame(all_results)
+    return result_df
+    # if save_landmark_file:
+    #     result_df.to_csv(os.path.join(output_folder, "landmark_detection_summary.csv"), index=False)
 
-          landmark_name = landmark_name_list[landmark_label_reorder[j]]
-          if voxel_coordinate is not None:
-            world_coordinate = masked_landmark_mask_prob.TransformContinuousIndexToPhysicalPoint(voxel_coordinate)
-            print("world coordinate of volume {0} landmark {1} is:[{2},{3},{4}]".format(
-              file_name_list[i], j, world_coordinate[0], world_coordinate[1], world_coordinate[2]))
-            detected_landmark.append(
-                [landmark_name, world_coordinate[0], world_coordinate[1], world_coordinate[2]]
-            )
-          else:
-            print("world coordinate of volume {0} landmark {1} is not detected.".format(file_name_list[i], j))
-            detected_landmark.append([landmark_name, -1, -1, -1])
-
-        detected_landmark_df = pd.DataFrame(data=detected_landmark, columns=['name', 'x', 'y', 'z'])
-        if return_landmark_file:
-            landmark_files.append(detected_landmark_df)
-
-        if save_landmark_file:
-            detected_landmark_save_path = os.path.join(output_folder, '{}.csv'.format(file_name_list[i]))
-            detected_landmark_df.to_csv(detected_landmark_save_path, index=False)
-
-        saving_time = time.time() - begin
-        print('read: {:.2f} s, prediction: {:.2f} s, saving: {:.2f} s'.format(
-            read_image_time + load_model_time, inference_time, saving_time)
-        )
-
-    return landmark_files
+    # if return_landmark_file:
+    #     return result_df
+    # else:
+    #     return None

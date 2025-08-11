@@ -39,6 +39,7 @@ To check if the landmark masks are correctly generated, we recommend using [ITK-
 Run the following code for training with a single GPU.
 The user may need to modify training settings in ``./config/lmk_train_config.py``. By default, the model will be saved in ``./saves/weights``.
 ```
+export PYTHONPATH=$(pwd):$PYTHONPATH
 cd detection3d
 python lmk_det_train.py --input ./config/lmk_train_config.py --gpus 0
 ```

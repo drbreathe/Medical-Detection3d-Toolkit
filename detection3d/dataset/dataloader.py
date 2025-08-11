@@ -3,7 +3,7 @@ from detection3d.dataset.landmark_dataset import LandmarkDetectionDataset
 from detection3d.dataset.sampler import EpochConcateSampler, RandomSubsetSampler
 
 
-def get_landmark_detection_dataloader(cfg, mode):
+def get_landmark_detection_dataloader(cfg, mode, seed=100):
     """
     Get landmark detection data loader
     """
@@ -53,7 +53,7 @@ def get_landmark_detection_dataloader(cfg, mode):
             crop_normalizers=cfg.dataset.crop_normalizers)
 
         num_cases = int(len(dataset) * cfg.val.eval_fraction)// 2 * 2
-        sampler = RandomSubsetSampler(dataset, num_cases, seed=100)
+        sampler = RandomSubsetSampler(dataset, num_cases, seed= seed)
         data_loader = DataLoader(dataset, sampler=sampler, batch_size=cfg.val.batch_size,
                                     num_workers=cfg.val.num_threads, pin_memory=True)
 

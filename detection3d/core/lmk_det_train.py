@@ -13,6 +13,7 @@ from detection3d.loss.focal_loss import FocalLoss
 from detection3d.utils.file_io import load_config, setup_logger
 from detection3d.utils.model_io import load_checkpoint, save_landmark_detection_checkpoint
 from detection3d.dataset.dataloader import get_landmark_detection_dataloader
+from tqdm import tqdm
 
 
 def compute_landmark_mask_loss(outputs, landmark_masks, loss_function):
@@ -200,8 +201,8 @@ def train(config_file):
     train_data_loader, num_modality, num_landmark_classes, num_train_cases = \
         get_landmark_detection_dataloader(cfg, 'train')
     
-    val_data_loader, _, _, num_val_cases = \
-        get_landmark_detection_dataloader(cfg, 'val')
+    # val_data_loader, _, _, num_val_cases = \
+    #     get_landmark_detection_dataloader(cfg, 'val')
 
     net_module = importlib.import_module('detection3d.network.' + cfg.net.name)
     net = net_module.Net(num_modality, num_landmark_classes)
@@ -215,7 +216,8 @@ def train(config_file):
     assert np.all(np.array(cfg.dataset.crop_size) % max_stride == 0), 'crop size not divisible by max stride'
 
     # training optimizer
-    opt = optim.Adam(net.parameters(), lr=cfg.train.lr, betas=cfg.train.betas)
+    opt = optim.AdamW(net.parameters(), lr=cfg.train.lr, betas=cfg.train.betas, weight_decay=cfg.train.weight_decay)
+
 
     # load checkpoint if resume epoch > 0
     if cfg.general.resume_epoch >= 0:
@@ -240,7 +242,16 @@ def train(config_file):
     train_loss_epoch = 0
     train_batch_size = 0
 
-    for i, (crops, landmark_masks, landmark_coords, frames, filenames) in enumerate(train_data_loader, start=batch_start):
+    print ("Training started with {} training cases and {} validation cases".format(num_train_cases, num_val_cases))
+    
+    train_loader_iter = tqdm(
+        enumerate(train_data_loader, start=batch_start),
+        total=len(train_data_loader),
+        desc="Training",
+        unit="batch"
+    )
+    val_data_loader_seed_count = 100
+    for i, (crops, landmark_masks, landmark_coords, frames, filenames) in train_loader_iter:
         begin_t = time.time()
         batch_size = crops.size(0)
         train_batch_size += batch_size
@@ -258,11 +269,13 @@ def train(config_file):
         if epoch_idx > prev_epoch_idx:
             avg_train_loss_per_sample = train_loss_epoch / train_batch_size
 
-            force_val = (cfg.general.resume_epoch >= 0 and prev_epoch_idx == cfg.general.resume_epoch)            
+            force_val = (cfg.general.resume_epoch >= 0 and prev_epoch_idx == cfg.general.resume_epoch)
             if epoch_idx == 1 or epoch_idx % cfg.val.interval == 0 or force_val:
+                val_data_loader_seed_count+=1
+                val_data_loader, _, _, num_val_cases = get_landmark_detection_dataloader(cfg, 'val', val_data_loader_seed_count)
                 avg_val_loss_per_sample = val_step(cfg, net, val_data_loader, loss_func)
 
-            msg = 'epoch: {}, batch: {}, train_loss: {:.4f}, val_loss: {:.4f}, time: {:.4f} s/vol'
+            msg = 'epoch: {}, batch: {}, train_loss: {:.6f}, val_loss: {:.6f}, time: {:.4f} s/vol'
             logger.info(msg.format(epoch_idx, batch_idx, avg_train_loss_per_sample, avg_val_loss_per_sample, sample_duration))
 
             writer.add_scalars('Loss_epoch', {
