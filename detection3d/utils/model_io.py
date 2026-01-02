@@ -60,51 +60,135 @@ def load_checkpoint(epoch_idx, net, opt, scaler, save_dir):
     return state['epoch'], state['batch']
 
 
-def save_landmark_detection_checkpoint(net, opt, scaler, epoch_idx, batch_idx, cfg, config_file, max_stride, num_modality):
-    """ save model and parameters into a checkpoint file (.pth)
+# def save_landmark_detection_checkpoint(net, opt, scaler, epoch_idx, batch_idx, cfg, config_file, max_stride, num_modality):
+#     """ save model and parameters into a checkpoint file (.pth)
 
-    :param net: the network object
-    :param opt: the optimizer object
-    :param scaler: the scaler object
-    :param epoch_idx: the epoch index
-    :param batch_idx: the batch index
-    :param cfg: the configuration object
-    :param config_file: the configuration file path
-    :param max_stride: the maximum stride of network
-    :param num_modality: the number of image modalities
-    :return: None
+#     :param net: the network object
+#     :param opt: the optimizer object
+#     :param scaler: the scaler object
+#     :param epoch_idx: the epoch index
+#     :param batch_idx: the batch index
+#     :param cfg: the configuration object
+#     :param config_file: the configuration file path
+#     :param max_stride: the maximum stride of network
+#     :param num_modality: the number of image modalities
+#     :return: None
+#     """
+#     chk_folder = os.path.join(cfg.general.save_dir, 'checkpoints', 'chk_{}'.format(epoch_idx))
+#     if not os.path.isdir(chk_folder):
+#         os.makedirs(chk_folder)
+
+#     state = {'epoch':                 epoch_idx,
+#              'batch':                 batch_idx,
+#              'net':                   cfg.net.name,
+#              'max_stride':            max_stride,
+#              'state_dict':            net.state_dict(),
+#              'crop_spacing':          cfg.dataset.crop_spacing,
+#              'crop_size':             cfg.dataset.crop_size,
+#              'pad_size':              cfg.dataset.pad_size,
+#              'interpolation':         cfg.dataset.interpolation,
+#              'in_channels':           num_modality,
+#              'num_landmark_classes':  len(cfg.general.target_landmark_label),
+#              'crop_normalizers':      [normalizer.to_dict() for normalizer in cfg.dataset.crop_normalizers]}
+
+#     # save python check point and optimizer state
+#     parm_filename = os.path.join(chk_folder, 'params.pth')
+#     torch.save(state, parm_filename)
+
+#     optm_filename = os.path.join(chk_folder, 'optimizer.pth')
+#     torch.save(opt.state_dict(), optm_filename)
+
+#     if scaler is not None:
+#       torch.save(scaler.state_dict(), os.path.join(chk_folder, "scaler.pth"))
+
+#     # save training and inference configuration files
+#     config_folder = os.path.dirname(os.path.dirname(__file__))
+#     infer_config_file = os.path.join(os.path.join(config_folder, 'config', 'lmk_infer_config.py'))
+#     shutil.copy(infer_config_file, os.path.join(chk_folder, 'lmk_infer_config.py'))
+
+#     shutil.copy(os.path.join(cfg.general.save_dir, os.path.basename(config_file)),
+#                 os.path.join(chk_folder, 'lmk_train_config.py'))
+import os
+import shutil
+import torch
+
+
+def save_landmark_detection_checkpoint(
+    net,
+    opt,
+    scaler,
+    epoch_idx,
+    batch_idx,
+    cfg,
+    config_file,
+    max_stride,
+    num_modality,
+    tag="current",   # ✅ "current" or "best"
+):
     """
-    chk_folder = os.path.join(cfg.general.save_dir, 'checkpoints', 'chk_{}'.format(epoch_idx))
-    if not os.path.isdir(chk_folder):
-        os.makedirs(chk_folder)
+    Save checkpoint into:
+        cfg.general.save_dir/checkpoints/{tag}/
 
-    state = {'epoch':                 epoch_idx,
-             'batch':                 batch_idx,
-             'net':                   cfg.net.name,
-             'max_stride':            max_stride,
-             'state_dict':            net.state_dict(),
-             'crop_spacing':          cfg.dataset.crop_spacing,
-             'crop_size':             cfg.dataset.crop_size,
-             'pad_size':              cfg.dataset.pad_size,
-             'interpolation':         cfg.dataset.interpolation,
-             'in_channels':           num_modality,
-             'num_landmark_classes':  len(cfg.general.target_landmark_label),
-             'crop_normalizers':      [normalizer.to_dict() for normalizer in cfg.dataset.crop_normalizers]}
+    tag: "current" or "best"
+    """
 
-    # save python check point and optimizer state
-    parm_filename = os.path.join(chk_folder, 'params.pth')
+    assert tag in ["current", "best"], f"Invalid tag={tag}. Must be 'current' or 'best'"
+
+    chk_folder = os.path.join(cfg.general.save_dir, "checkpoints", tag)
+
+    # ✅ overwrite folder each time
+    if os.path.isdir(chk_folder):
+        shutil.rmtree(chk_folder)
+    os.makedirs(chk_folder, exist_ok=True)
+
+    # ----------------------------------------------------------------------
+    # ✅ MODEL PARAMS + METADATA
+    # ----------------------------------------------------------------------
+    state = {
+        "epoch": epoch_idx,
+        "batch": batch_idx,
+        "net": cfg.net.name,
+        "max_stride": max_stride,
+        "state_dict": net.state_dict(),
+
+        "crop_spacing": cfg.dataset.crop_spacing,
+        "crop_size": cfg.dataset.crop_size,
+        "pad_size": cfg.dataset.pad_size,
+        "interpolation": cfg.dataset.interpolation,
+
+        "in_channels": num_modality,
+        "num_landmark_classes": len(cfg.general.target_landmark_label) + 1,
+        "crop_normalizers": [normalizer.to_dict() for normalizer in cfg.dataset.crop_normalizers],
+    }
+
+    parm_filename = os.path.join(chk_folder, "params.pth")
     torch.save(state, parm_filename)
 
-    optm_filename = os.path.join(chk_folder, 'optimizer.pth')
-    torch.save(opt.state_dict(), optm_filename)
+    # optimizer state
+    opt_filename = os.path.join(chk_folder, "optimizer.pth")
+    torch.save(opt.state_dict(), opt_filename)
 
+    # AMP scaler state
     if scaler is not None:
-      torch.save(scaler.state_dict(), os.path.join(chk_folder, "scaler.pth"))
+        scaler_filename = os.path.join(chk_folder, "scaler.pth")
+        torch.save(scaler.state_dict(), scaler_filename)
 
-    # save training and inference configuration files
+    # ----------------------------------------------------------------------
+    # ✅ COPY CONFIG FILES
+    # ----------------------------------------------------------------------
+    # training config copy
+    shutil.copy(
+        os.path.join(cfg.general.save_dir, os.path.basename(config_file)),
+        os.path.join(chk_folder, "lmk_train_config.py"),
+    )
+
+    # inference config (static file in toolkit)
     config_folder = os.path.dirname(os.path.dirname(__file__))
-    infer_config_file = os.path.join(os.path.join(config_folder, 'config', 'lmk_infer_config.py'))
-    shutil.copy(infer_config_file, os.path.join(chk_folder, 'lmk_infer_config.py'))
+    infer_config_file = os.path.join(config_folder, "config", "lmk_infer_config.py")
 
-    shutil.copy(os.path.join(cfg.general.save_dir, os.path.basename(config_file)),
-                os.path.join(chk_folder, 'lmk_train_config.py'))
+    if os.path.isfile(infer_config_file):
+        shutil.copy(infer_config_file, os.path.join(chk_folder, "lmk_infer_config.py"))
+    else:
+        print(f"[WARN] infer config not found: {infer_config_file}")
+
+    print(f"[INFO] Saved checkpoint ({tag}) → {chk_folder}")

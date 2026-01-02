@@ -132,6 +132,19 @@ class LandmarkDetectionDataset(Dataset):
     self.crop_size = np.array(crop_size, dtype=np.float32)
     self.pad_size = pad_size
     self.sampling_method = sampling_method
+    
+    # ------------------------------------------------------------------
+    # HYBRID / LOCAL landmark sampling settings
+    # ------------------------------------------------------------------
+    # Probability of sampling local-to-landmark crop center (rest is GLOBAL)
+    self.local_to_lmk_prob = getattr(aug_cfg, "local_to_lmk_prob", 0.9)
+
+    # Debug: collect sampling stats
+    self.debug_sampling_stats = False
+    self._stats_local = 0
+    self._stats_global = 0
+    self._stats_total = 0
+    
     self.sampling_size = sampling_size
     self.positive_upper_bound = positive_upper_bound
     self.negative_lower_bound = negative_lower_bound
@@ -172,7 +185,7 @@ class LandmarkDetectionDataset(Dataset):
   def num_organ_classes(self):
     return self.num_organ_classes
 
-  def global_sample(self, image):
+  def global_sample(self, image, jitter_mm):
       """ random sample a position in the image
       :param image: a SimpleITK image object which should be in the RAI coordinate
       :return: a world position in the RAI coordinate
@@ -192,7 +205,67 @@ class LandmarkDetectionDataset(Dataset):
       crop_corner_start = origin + np.random.uniform(0, 1, size=3) * max_offsets_mm
 
       crop_center_mm = crop_corner_start + crop_size_mm / 2
+    
+      center_min = origin + crop_size_mm / 2.0
+      center_max = origin + im_size_mm - crop_size_mm / 2.0
+
+      # optional jitter
+      if jitter_mm > 0:
+          jitter = np.random.uniform(-jitter_mm, jitter_mm, size=3)
+          crop_center_mm = crop_center_mm + jitter
+          crop_center_mm = np.clip(crop_center_mm, center_min, center_max)
+
       return crop_center_mm
+    
+  def local_to_lmk_sample(self, image, landmark_coords_dict, jitter_mm=15.0):
+    """
+    Sample crop center near a randomly chosen landmark.
+    Ensures crop stays inside image boundaries.
+
+    Args:
+        image (sitk.Image): reference image/mask for bounds
+        landmark_coords_dict (dict): {'coords': [[x,y,z], ...]}
+        jitter_mm (float): random uniform jitter around landmark center in mm
+
+    Returns:
+        crop_center_mm: np.ndarray shape (3,)
+    """
+    assert isinstance(image, sitk.Image)
+
+    coords_list = landmark_coords_dict["coords"]
+    if coords_list is None or len(coords_list) == 0:
+        return self.global_sample(image, jitter_mm)
+
+    origin = np.array(image.GetOrigin(), dtype=np.float64)
+    spacing = np.array(image.GetSpacing(), dtype=np.float64)
+    size = np.array(image.GetSize(), dtype=np.float64)
+
+    im_size_mm = size * spacing
+    crop_size_mm = self.crop_size * self.crop_spacing
+
+    center_min = origin + crop_size_mm / 2.0
+    center_max = origin + im_size_mm - crop_size_mm / 2.0
+
+    # pick random landmark
+    lmk_mm = np.array(coords_list[np.random.randint(0, len(coords_list))], dtype=np.float64)
+
+    # jitter around landmark
+    jitter = np.random.uniform(-jitter_mm, jitter_mm, size=3)
+    crop_center_mm = lmk_mm + jitter
+    # print(lmk_mm, crop_center_mm, jitter_mm)
+
+    # clamp center so crop doesn't go out-of-bounds
+    crop_center_mm = np.clip(crop_center_mm, center_min, center_max)
+
+    return crop_center_mm
+
+  def print_sampling_stats(self, every_n=500):
+    if not self.debug_sampling_stats:
+        return
+    if self._stats_total > 0 and (self._stats_total % every_n == 0):
+        p_local = 100.0 * self._stats_local / max(self._stats_total, 1)
+        p_global = 100.0 * self._stats_global / max(self._stats_total, 1)
+        print(f"[SAMPLING] total={self._stats_total} | local={p_local:.1f}% | global={p_global:.1f}%")
 
   def center_sample(self, image):
     """ return the world coordinate of the image center
@@ -393,15 +466,46 @@ class LandmarkDetectionDataset(Dataset):
     image = pad_image(image, self.pad_size, pad_value=0)
     landmark_mask = pad_image(landmark_mask, self.pad_size, pad_value=-1)
 
-    # sampling a crop center
-    if self.sampling_method == 'GLOBAL':
-      crop_center_mm = self.global_sample(landmark_mask) # From landmark_mask find a random point in mm.
+    # ---------------------------------------------------------------
+    # Sampling crop center
+    # ---------------------------------------------------------------
+    if self.sampling_method == "GLOBAL":
+        crop_center_mm = self.global_sample(landmark_mask, self.augmentation_translation_lmk)
+
+        if self.debug_sampling_stats:
+            self._stats_global += 1
+
+    elif self.sampling_method == "LOCAL_TO_LMK":
+        crop_center_mm = self.local_to_lmk_sample(
+            landmark_mask,
+            self.landmark_coords_dict[image_name],
+            jitter_mm=self.augmentation_translation_lmk
+        )
+
+        if self.debug_sampling_stats:
+            self._stats_local += 1
+
+    elif self.sampling_method == "HYBRID":
+        if np.random.rand() < self.local_to_lmk_prob:
+            crop_center_mm = self.local_to_lmk_sample(
+                landmark_mask,
+                self.landmark_coords_dict[image_name],
+                jitter_mm=self.augmentation_translation_lmk
+            )
+
+            if self.debug_sampling_stats:
+                self._stats_local += 1
+        else:
+            crop_center_mm = self.global_sample(landmark_mask, self.augmentation_translation_lmk)
+
+            if self.debug_sampling_stats:
+                self._stats_global += 1
 
     else:
-      raise ValueError('Only support CENTER, GLOBAL, MASK, and HYBRID sampling methods')
+        raise ValueError("Only support GLOBAL, LOCAL_TO_LMK, HYBRID sampling methods")
 
-    # random translation
-    crop_center_mm += np.random.uniform(-self.augmentation_translation_lmk, self.augmentation_translation_lmk, size=[3])
+    if self.debug_sampling_stats:
+        self._stats_total += 1
 
     # sample a crop from image and normalize it
     # We are working with one image and one mask at a time.
