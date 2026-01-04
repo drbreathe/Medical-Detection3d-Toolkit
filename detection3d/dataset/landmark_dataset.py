@@ -5,7 +5,7 @@ import SimpleITK as sitk
 import torch
 from torch.utils.data import Dataset
 import torchio as tio
-
+import random
 from detection3d.utils.image_tools import select_random_voxels_in_multi_class_mask, \
   crop_image, convert_image_to_tensor, get_image_frame, pad_image
 from detection3d.utils.landmark_utils import is_world_coordinate_valid, \
@@ -115,7 +115,11 @@ class LandmarkDetectionDataset(Dataset):
                 augmentation_turn_on,
                 aug_cfg,
                 interpolation,
-                crop_normalizers):
+                crop_normalizers,
+                num_crops_per_image,
+                local_fraction,
+                max_sampling_attempts,
+                local_jitter_mm):
     
     self.mode = mode.lower()
     assert self.mode in ['train', 'val']
@@ -129,7 +133,7 @@ class LandmarkDetectionDataset(Dataset):
       self.image_name_list, self.landmark_file_path, self.target_landmark_label
     )
     self.crop_spacing = np.array(crop_spacing, dtype=np.float32)
-    self.crop_size = np.array(crop_size, dtype=np.float32)
+    self.crop_size = np.array(crop_size, dtype=np.int32)
     self.pad_size = pad_size
     self.sampling_method = sampling_method
     self.sampling_size = sampling_size
@@ -144,6 +148,15 @@ class LandmarkDetectionDataset(Dataset):
     self.augmentation_turn_on = augmentation_turn_on
     self.interpolation = interpolation
     self.crop_normalizers = crop_normalizers
+    
+    self.num_crops_per_image = int(num_crops_per_image)
+    self.local_fraction = float(local_fraction)
+    self.max_sampling_attempts = int(max_sampling_attempts)
+    self.local_jitter_mm = float(local_jitter_mm)
+
+    # physical crop geometry (mm)
+    self.crop_size_mm = self.crop_size * self.crop_spacing
+    self.half_crop_mm = 0.5 * self.crop_size_mm
 
     if self.augmentation_turn_on:
       self.aug_transform = self.build_transform(aug_cfg)
@@ -171,6 +184,55 @@ class LandmarkDetectionDataset(Dataset):
 
   def num_organ_classes(self):
     return self.num_organ_classes
+  
+  def _get_valid_landmark_indices(self, landmark_df):
+    valid = []
+    for i, world in enumerate(landmark_df["coords"]):
+        if is_world_coordinate_valid(world):
+            valid.append(i)
+    return valid
+
+
+  def _sample_local_center_mm(self, landmark_coords):
+      """
+      Sample a crop center near a randomly chosen valid landmark (in mm),
+      with uniform jitter in mm.
+      Returns: crop_center_mm (np.ndarray shape [3]) or None
+      """
+      valid_ids = self._get_valid_landmark_indices(landmark_coords)
+      if len(valid_ids) == 0:
+          return None
+
+      for _ in range(self.max_sampling_attempts):
+          lmk_id = np.random.choice(valid_ids)
+          lmk_mm = np.array(landmark_coords["coords"][lmk_id], dtype=np.float64)
+
+          # jitter in mm
+          jitter = np.random.uniform(-self.local_jitter_mm, self.local_jitter_mm, size=(3,))
+
+          # ✅ ensure jitter doesn't exceed half crop in any dimension
+          if np.all(np.abs(jitter) <= self.half_crop_mm):
+              return lmk_mm + jitter
+
+      return None
+    
+  def _sample_local_center_mm_from_id(self, landmark_coords, lmk_id, jitter_mm):
+    """
+    Sample a crop center near a specific landmark index (in mm),
+    with uniform jitter in mm (train) or jitter_mm=0 (val).
+    Returns: crop_center_mm (np.ndarray shape [3]) or None
+    """
+    lmk_mm = np.array(landmark_coords["coords"][lmk_id], dtype=np.float64)
+
+    for _ in range(self.max_sampling_attempts):
+        jitter = np.random.uniform(-jitter_mm, jitter_mm, size=(3,))
+
+        # ensure jitter doesn't exceed half crop in any dimension
+        if np.all(np.abs(jitter) <= self.half_crop_mm):
+            return lmk_mm + jitter
+
+    return lmk_mm  # fallback: no jitter
+
 
   def global_sample(self, image):
       """ random sample a position in the image
@@ -232,8 +294,10 @@ class LandmarkDetectionDataset(Dataset):
     image_size = landmark_mask.GetSize()
     if len(valid_landmark_idx) > 0:
       for _ in range(self.num_pos_patches_per_image):
-        landmark_idx = np.random.randint(0, len(valid_landmark_idx))
+        choice = np.random.randint(0, len(valid_landmark_idx))
+        landmark_idx = valid_landmark_idx[choice]
         landmark_world = landmark_df['coords'][landmark_idx]
+
         landmark_voxel = list(landmark_mask.TransformPhysicalPointToIndex(landmark_world))
         if is_voxel_coordinate_valid(landmark_voxel, image_size):
           perturbs_idx = np.random.randint(0, len(self.positive_perturbs))
@@ -372,7 +436,6 @@ class LandmarkDetectionDataset(Dataset):
 
       return image_aug
 
-
   def __getitem__(self, index):
     """ get a training sample - image(s) and segmentation pair
     :param index:  the sample index
@@ -389,49 +452,120 @@ class LandmarkDetectionDataset(Dataset):
     landmark_coords = self.landmark_coords_dict[image_name]
     landmark_mask_path = self.landmark_mask_path[index]
     landmark_mask = sitk.ReadImage(landmark_mask_path, sitk.sitkFloat32)
-    
+
     image = pad_image(image, self.pad_size, pad_value=0)
     landmark_mask = pad_image(landmark_mask, self.pad_size, pad_value=-1)
 
-    # sampling a crop center
-    if self.sampling_method == 'GLOBAL':
-      crop_center_mm = self.global_sample(landmark_mask) # From landmark_mask find a random point in mm.
+    # ----------------------------
+    # Hybrid multi-crop sampling (ROBUST + BALANCED + DET VAL)
+    # ----------------------------
 
+    # ✅ validation should be deterministic and local-heavy
+    if self.mode == "val":
+        num_local = self.num_crops_per_image
+        num_global = 0
+        jitter_mm = 0.0
     else:
-      raise ValueError('Only support CENTER, GLOBAL, MASK, and HYBRID sampling methods')
+        num_local = int(round(self.num_crops_per_image * self.local_fraction))
+        num_global = self.num_crops_per_image - num_local
+        jitter_mm = self.local_jitter_mm
 
-    # random translation
-    crop_center_mm += np.random.uniform(-self.augmentation_translation_lmk, self.augmentation_translation_lmk, size=[3])
+    crop_centers_mm = []
 
-    # sample a crop from image and normalize it
-    # We are working with one image and one mask at a time.
-    
-    landmark_mask = crop_image(landmark_mask, crop_center_mm, self.crop_size, self.crop_spacing, 'NN')
-    landmark_mask = self.select_samples_in_the_landmark_mask(landmark_mask, self.landmark_coords_dict[image_name])
+    valid_ids = self._get_valid_landmark_indices(landmark_coords)
 
-    for idx in range(len(images)):
-      images[idx] = crop_image(images[idx], crop_center_mm, self.crop_size, self.crop_spacing, self.interpolation)
-      if self.crop_normalizers[idx] is not None:
-          images[idx] = self.crop_normalizers[idx](images[idx])
+    # ✅ Local crops: landmark-balanced (cyclic, deterministic per index)
+    if len(valid_ids) > 0:
+        if self.mode == "val":
+          start = index % len(valid_ids)    # deterministic
+        else:
+            start = (index + np.random.randint(0, len(valid_ids))) % len(valid_ids)
 
-      # Apply augmentations
-      if self.mode == 'train' and self.augmentation_turn_on:
-          images[idx], landmark_mask = self.augment(images[idx], landmark_mask)
+        for i in range(num_local):
+            lmk_id = valid_ids[(start + i) % len(valid_ids)]
+            c = self._sample_local_center_mm_from_id(
+                landmark_coords,
+                lmk_id,
+                jitter_mm=jitter_mm
+            )
+            crop_centers_mm.append(c)
+    else:
+        # fallback: no valid landmark => global
+        for _ in range(num_local):
+            crop_centers_mm.append(self.global_sample(landmark_mask))
 
-    # convert image and masks to tensors
-    image_tensor = convert_image_to_tensor(images)
-    landmark_mask_tensor = convert_image_to_tensor(landmark_mask)
+    # ✅ Global crops (only train)
+    for _ in range(num_global):
+        crop_centers_mm.append(self.global_sample(landmark_mask))
+
+    # ✅ Shuffle only in train (keeps val deterministic)
+    if self.mode == "train":
+        random.shuffle(crop_centers_mm)
+
+    # ----------------------------
+    # Collect crops
+    # ----------------------------
+    all_images = []
+    all_masks = []
+
+    for crop_center_mm in crop_centers_mm:
+
+        # ✅ apply translation augmentation ONLY during training
+        if self.mode == "train":
+            crop_center_mm = crop_center_mm + np.random.uniform(
+                -self.augmentation_translation_lmk,
+                self.augmentation_translation_lmk,
+                size=[3]
+            )
+
+        # ✅ clamp center so crop stays inside image bounds
+        origin = np.array(landmark_mask.GetOrigin(), dtype=np.float64)
+        spacing = np.array(landmark_mask.GetSpacing(), dtype=np.float64)
+        size = np.array(landmark_mask.GetSize(), dtype=np.float64)
+
+        min_center = origin + self.half_crop_mm
+        max_center = origin + size * spacing - self.half_crop_mm
+
+        crop_center_mm = np.minimum(np.maximum(crop_center_mm, min_center), max_center)
+
+        # crop landmark mask + sparse supervision
+        crop_mask = crop_image(landmark_mask, crop_center_mm, self.crop_size, self.crop_spacing, 'NN')
+
+        crop_mask = self.select_samples_in_the_landmark_mask(crop_mask, landmark_coords)
+
+        # crop images for each modality
+        crop_images = []
+        for idx in range(len(images)):
+            crop_img = crop_image(images[idx], crop_center_mm, self.crop_size, self.crop_spacing, self.interpolation)
+
+            if self.crop_normalizers[idx] is not None:
+                crop_img = self.crop_normalizers[idx](crop_img)
+
+            if self.mode == 'train' and self.augmentation_turn_on:
+                crop_img, crop_mask = self.augment(crop_img, crop_mask)
+
+            crop_images.append(crop_img)
+
+        # convert to tensors
+        img_tensor = convert_image_to_tensor(crop_images)   # [C, D, H, W]
+        mask_tensor = convert_image_to_tensor(crop_mask)    # [1, D, H, W]
+
+        all_images.append(img_tensor)
+        all_masks.append(mask_tensor)
+
+    # stack -> [X, C, D, H, W] and [X, 1, D, H, W]
+    image_tensor = torch.stack(all_images, dim=0)
+    landmark_mask_tensor = torch.stack(all_masks, dim=0)
 
     # convert landmark coords to tensor
     landmark_coords_list = []
     indices = np.argsort(landmark_coords['label'])
     for idx in indices:
-      coords = landmark_coords['coords'][idx]
-      landmark_coords_list.append([coords[0], coords[1], coords[2]])
+        coords = landmark_coords['coords'][idx]
+        landmark_coords_list.append([coords[0], coords[1], coords[2]])
     landmark_coords_tensor = torch.from_numpy(np.array(landmark_coords_list, dtype=np.float32))
 
     # image frame
     image_frame = get_image_frame(images[0])
 
-    return image_tensor, landmark_mask_tensor, \
-            landmark_coords_tensor, image_frame, image_name
+    return image_tensor, landmark_mask_tensor, landmark_coords_tensor, image_frame, image_name
