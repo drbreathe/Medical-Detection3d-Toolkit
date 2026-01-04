@@ -24,7 +24,11 @@ def get_landmark_detection_dataloader(cfg, mode, seed=100):
             augmentation_turn_on=cfg.augmentation.turn_on,
             aug_cfg= cfg.augmentation,
             interpolation=cfg.dataset.interpolation,
-            crop_normalizers=cfg.dataset.crop_normalizers)
+            crop_normalizers=cfg.dataset.crop_normalizers,
+            num_crops_per_image=2,
+            local_fraction=0.5,
+            max_sampling_attempts=5,
+            local_jitter_mm=10.0)
         
         num_cases = len(dataset)
         sampler = EpochConcateSampler(dataset, cfg.train.epochs)
@@ -49,7 +53,11 @@ def get_landmark_detection_dataloader(cfg, mode, seed=100):
             augmentation_turn_on=cfg.augmentation.turn_on,
             aug_cfg= cfg.augmentation,
             interpolation=cfg.dataset.interpolation,
-            crop_normalizers=cfg.dataset.crop_normalizers)
+            crop_normalizers=cfg.dataset.crop_normalizers,
+            num_crops_per_image=1,
+            local_fraction=1,
+            max_sampling_attempts=5,
+            local_jitter_mm=0)
 
         num_cases = int(len(dataset) * cfg.val.eval_fraction)// 2 * 2
         sampler = RandomSubsetSampler(dataset, num_cases, seed= seed)

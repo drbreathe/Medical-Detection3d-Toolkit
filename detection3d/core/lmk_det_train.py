@@ -135,7 +135,17 @@ def train_step(cfg, net, crops, landmark_masks, frames, filenames,
 
     net.train()
 
+    # ---- Multi-crop flatten: [B, X, C, D, H, W] -> [B*X, C, D, H, W]
+    multi_crop = (crops.dim() == 6)
+    if multi_crop:
+        B, X = crops.shape[:2]
+        crops = crops.view(B * X, *crops.shape[2:])
+        landmark_masks = landmark_masks.view(B * X, *landmark_masks.shape[2:])
+
+    # Move to GPU
     if cfg.general.num_gpus > 0:
+        crops = crops.cuda(non_blocking=True)
+        landmark_masks = landmark_masks.cuda(non_blocking=True)
         crops = crops.cuda(non_blocking=True)
         landmark_masks = landmark_masks.cuda(non_blocking=True)
 
@@ -203,7 +213,7 @@ def val_step(cfg, network, val_data_loader, loss_function):
                 val_loss = compute_landmark_mask_loss(outputs, landmark_masks, loss_function)
 
             val_loss_epoch += val_loss.item()
-            total_samples += batch_size
+            total_samples += effective_batch_size
 
     return val_loss_epoch / max(total_samples, 1)
 
@@ -324,8 +334,12 @@ def train(config_file):
     for _, (crops, landmark_masks, _, frames, filenames) in loader_iter:
 
         begin_t = time.time()
+
         batch_size = crops.size(0)
-        train_batch_size += batch_size
+        num_crops = crops.size(1) if crops.dim() == 6 else 1
+        effective_batch_size = batch_size * num_crops
+
+        train_batch_size += effective_batch_size
 
         loss, did_step = train_step(
             cfg, net, crops, landmark_masks, frames, filenames,

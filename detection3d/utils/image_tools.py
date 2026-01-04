@@ -460,33 +460,6 @@ def resample_spacing(image, resampled_spacing, max_stride, interp_method):
     return sitk.Resample(image, out_size, identity_transform, interp_method, in_origin, resampled_spacing,
                             in_direction)
 
-
-def pick_largest_connected_component(mask, labels):
-    """ Pick the largest connected component.
-    :param mask: The multi label mask
-    :param labels: The labels which will be selected the largest connect component.
-    """
-    assert isinstance(mask, sitk.Image)
-    assert isinstance(labels, list)
-
-    filter = sitk.ConnectedComponentImageFilter()
-    filter.SetFullyConnected(True)
-
-    largest_cc_binaries = []
-    for label in labels:
-        mask_binary = (mask == label)
-        mask_binary_cc = filter.Execute(mask_binary)
-
-        mask_binary_cc = sitk.RelabelComponent(mask_binary_cc)
-        mask_binary_largest_cc = (mask_binary_cc == 1)
-        largest_cc_binaries.append(mask_binary_largest_cc)
-
-    largest_cc_multi = largest_cc_binaries[0]
-    for idx in range(1, len(labels)):
-      largest_cc_multi = sitk.Add(largest_cc_multi, labels[idx] * largest_cc_binaries[idx])
-
-    return sitk.Cast(largest_cc_multi, mask.GetPixelID())
-
 def pick_largest_connected_component(
     mask: sitk.Image,
     labels: Sequence[Union[int, float]],
